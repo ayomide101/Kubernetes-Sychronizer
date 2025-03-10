@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,7 +26,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -45,7 +43,7 @@ var (
 
 // Global variables.
 var (
-	workQueue         workqueue.RateLimitingInterface
+	workQueue         workqueue.TypedRateLimitingInterface[any]
 	progressMap       sync.Map // key: jobID, value: status string
 	db                *sql.DB
 	primaryClient     *kubernetes.Clientset
@@ -134,7 +132,7 @@ func main() {
 	ensureAdminUser()
 
 	// Initialize work queue.
-	workQueue = workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+	workQueue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[any]())
 
 	// Build primary client.
 	var err error
@@ -175,7 +173,7 @@ func main() {
 	factory.WaitForCacheSync(stopCh)
 
 	// Start worker goroutines.
-	for i := 0; i < *workerCount; i++ {
+	for range *workerCount {
 		go worker()
 	}
 
@@ -196,7 +194,48 @@ func main() {
 }
 
 //
-// SQLite & User Management
+// Change Key & Duplication Prevention
+//
+
+// getChangeKey generates a key for the change so that already replicated changes can be skipped.
+func getChangeKey(resourceType, namespace, name, operation string, obj interface{}) string {
+	if operation == "delete" {
+		return fmt.Sprintf("%s:%s:%s:delete", resourceType, namespace, name)
+	}
+	var resourceVersion string
+	switch resourceType {
+	case "deployment":
+		if dep, ok := obj.(*appsv1.Deployment); ok {
+			resourceVersion = dep.ResourceVersion
+		}
+	case "statefulset":
+		if sts, ok := obj.(*appsv1.StatefulSet); ok {
+			resourceVersion = sts.ResourceVersion
+		}
+	case "secret":
+		if secret, ok := obj.(*corev1.Secret); ok {
+			resourceVersion = secret.ResourceVersion
+		}
+	case "configmap":
+		if cm, ok := obj.(*corev1.ConfigMap); ok {
+			resourceVersion = cm.ResourceVersion
+		}
+	}
+	return fmt.Sprintf("%s:%s:%s:%s", resourceType, namespace, name, resourceVersion)
+}
+
+// alreadyReplicated checks in the SQLite DB if a change with the given key was already successfully replicated.
+func alreadyReplicated(changeKey string) (bool, error) {
+	row := db.QueryRow("SELECT COUNT(*) FROM jobs WHERE change_key = ? AND status = 'Completed'", changeKey)
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+//
+// SQLite Functions
 //
 
 func initDB(dbPath string) error {
@@ -230,6 +269,22 @@ func initDB(dbPath string) error {
 		created_at DATETIME
 	);`
 	_, err = db.Exec(createUsersTableSQL)
+	return err
+}
+
+func insertJob(task ReplicationTask) error {
+	now := time.Now()
+	_, err := db.Exec(`INSERT INTO jobs (id, change_key, resource_type, namespace, name, operation, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		task.TaskID, task.ChangeKey, task.ResourceType, task.Namespace, task.Name, task.Operation, "enqueued", task.CreatedAt, now)
+	return err
+}
+
+func updateJob(taskID, status string, startedAt, finishedAt *time.Time, errorMsg string) error {
+	now := time.Now()
+	_, err := db.Exec(`UPDATE jobs SET status = ?, updated_at = ?, started_at = COALESCE(?, started_at), finished_at = ?, error_message = ?
+		WHERE id = ?`,
+		status, now, startedAt, finishedAt, errorMsg, taskID)
 	return err
 }
 
@@ -481,7 +536,7 @@ func loadReplicaClustersConfig(dir string) ([]*kubernetes.Clientset, error) {
 		fmt.Println("No replica kubeconfig directory provided.")
 		return clusters, nil
 	}
-	entries, err := ioutil.ReadDir(dir)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -505,10 +560,7 @@ func loadReplicaClustersConfig(dir string) ([]*kubernetes.Clientset, error) {
 	return clusters, nil
 }
 
-//
 // Task Enqueue & Processing (Replication Logic)
-//
-
 func enqueueReplicationTask(resourceType, namespace, name, operation string, obj interface{}) {
 	if !shouldSync(namespace) {
 		return
@@ -520,6 +572,7 @@ func enqueueReplicationTask(resourceType, namespace, name, operation string, obj
 		fmt.Printf("Error checking duplication: %v\n", err)
 	}
 	if already {
+		// Skip already replicated change.
 		return
 	}
 
@@ -566,6 +619,7 @@ func processReplicationTask(task ReplicationTask) {
 	var mu sync.Mutex
 	jobFailed := false
 	var errorMsg string
+	// local map to track failures for this task.
 	localFailures := make(map[int]string)
 
 	for idx, replica := range replicaClusters {
@@ -707,39 +761,17 @@ func updateTaskProgress(taskID, status string) {
 	progressMap.Store(taskID, status)
 }
 
-func getChangeKey(resourceType, namespace, name, operation string, obj interface{}) string {
-	if operation == "delete" {
-		return fmt.Sprintf("%s:%s:%s:delete", resourceType, namespace, name)
-	}
-	var resourceVersion string
-	switch resourceType {
-	case "deployment":
-		if dep, ok := obj.(*appsv1.Deployment); ok {
-			resourceVersion = dep.ResourceVersion
-		}
-	case "statefulset":
-		if sts, ok := obj.(*appsv1.StatefulSet); ok {
-			resourceVersion = sts.ResourceVersion
-		}
-	case "secret":
-		if secret, ok := obj.(*corev1.Secret); ok {
-			resourceVersion = secret.ResourceVersion
-		}
-	case "configmap":
-		if cm, ok := obj.(*corev1.ConfigMap); ok {
-			resourceVersion = cm.ResourceVersion
-		}
-	}
-	return fmt.Sprintf("%s:%s:%s:%s", resourceType, namespace, name, resourceVersion)
-}
+//
+// HTTP Handlers for Frontend
+//
 
-func alreadyReplicated(changeKey string) (bool, error) {
-	row := db.QueryRow("SELECT COUNT(*) FROM jobs WHERE change_key = ? AND status = 'Completed'", changeKey)
-	var count int
-	if err := row.Scan(&count); err != nil {
-		return false, err
-	}
-	return count > 0, nil
+// progressHandler shows the replication tasks and their statuses.
+func progressHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintf(w, "Replication Tasks Progress:\n")
+	progressMap.Range(func(key, value interface{}) bool {
+		fmt.Fprintf(w, "Task %s: %s\n", key, value)
+		return true
+	})
 }
 
 //
@@ -859,10 +891,10 @@ func shouldSync(namespace string) bool {
 }
 
 // Log panics.
-func init() {
-	runtime.ErrorHandlers = []func(error){
-		func(err error) {
-			fmt.Printf("Runtime error: %v\n", err)
-		},
-	}
-}
+// func init() {
+// 	runtime.ErrorHandlers = []func(error){
+// 		func(err error) {
+// 			fmt.Printf("Runtime error: %v\n", err)
+// 		},
+// 	}
+// }

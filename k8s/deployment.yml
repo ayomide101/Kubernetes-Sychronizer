@@ -1,0 +1,99 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: primary-cluster-secret
+type: Opaque
+data:
+  # Replace these with your actual base64-encoded kubeconfig contents.
+  primary.kubeconfig: <BASE64_ENCODED_PRIMARY_KUBECONFIG>
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: replica-cluster-secret
+type: Opaque
+data:
+  # Replace these with your actual base64-encoded kubeconfig contents.
+  replica1.kubeconfig: <BASE64_ENCODED_REPLICA1_KUBECONFIG>
+  replica2.kubeconfig: <BASE64_ENCODED_REPLICA2_KUBECONFIG>  
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-sync-sa
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-sync-role
+rules:
+  # Allow reading core resources (ConfigMaps, Secrets, Events, Namespaces)
+  - apiGroups: [""]
+    resources:
+      - configmaps
+      - secrets
+      - events
+      - namespaces
+    verbs: ["get", "list", "watch"]
+  # Allow reading apps resources (Deployments, StatefulSets)
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - statefulsets
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-sync-binding
+subjects:
+  - kind: ServiceAccount
+    name: k8s-sync-sa
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: k8s-sync-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-sync
+  labels:
+    app: k8s-sync
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-sync
+  template:
+    metadata:
+      labels:
+        app: k8s-sync
+    spec:
+      serviceAccountName: k8s-sync-sa
+      containers:
+      - name: k8s-sync
+        image: your-docker-image:latest
+        args:
+          - "-primary-kubeconfig=/etc/kubeconfigs/primary/primary.kubeconfig"
+          - "-replica-kubeconfig-dir=/etc/kubeconfigs/replicas"
+          - "-sync-namespaces=default,production" # Example: only sync these namespaces
+        volumeMounts:
+          - name: primary-kubeconfig
+            mountPath: /etc/kubeconfigs/primary/primary.kubeconfig
+            subPath: primary.kubeconfig
+          - name: replica-kubeconfigs
+            mountPath: /etc/kubeconfigs/replicas
+      volumes:
+        - name: primary-kubeconfig
+          secret:
+            secretName: primary-cluster-secret
+            items:
+              - key: primary.kubeconfig
+                path: primary.kubeconfig
+        - name: replica-kubeconfigs
+          secret:
+            secretName: replica-cluster-secret
