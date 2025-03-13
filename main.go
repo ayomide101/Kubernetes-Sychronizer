@@ -41,7 +41,7 @@ var (
 	primaryKubeconfig        = flag.String("primary", "", "Path to primary kubeconfig file")
 	replicaKubeconfigDir     = flag.String("replica-dir", "", "Directory containing replica kubeconfig files")
 	workerCount              = flag.Int("worker-count", 3, "Number of worker goroutines")
-	syncNamespacesStr        = flag.String("sync-namespaces", "", "Comma-separated list of namespaces to sync. If empty, all non-sensitive namespaces will be synced")
+	syncNamespacesStr        = flag.String("namespaces", "", "Comma-separated list of namespaces to sync. If empty, all non-sensitive namespaces will be synced")
 	syncOnce                 = flag.Bool("sync-once", false, "Run one-time sync mode (verbose) and exit")
 	allowSensitiveNamespaces = flag.Bool("allow-sensitive-namespaces", false, "Allow syncing of sensitive namespaces (names starting with 'kube')")
 )
