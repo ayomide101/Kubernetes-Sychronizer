@@ -1,6 +1,7 @@
 # K8s Sync CLI
 
-A Golang CLI application that synchronizes Kubernetes cluster namespaces by replicating resource changes (Deployments, StatefulSets, Secrets, ConfigMaps, and PersistentVolumeClaims) from a primary cluster to one or more replica clusters. The application supports both continuous watch mode and one-time sync mode, and includes built-in Prometheus metrics, a simple REST API for monitoring and management, and SQLite-based persistence for job tracking and user accounts.
+K8s Sync CLI is a Go-based command-line application designed to replicate Kubernetes resources from a primary cluster to one or more replica clusters. It supports both continuous watch mode (where it listens for events and replicates changes as they occur) and one-time sync mode (which performs an immediate, verbose synchronization) and includes built-in Prometheus metrics, a simple REST API for monitoring and management, and SQLite-based persistence for job tracking and user accounts.. The tool is highly configurable, allowing you to select which resource types to sync, restrict syncing to specific namespaces, and even skip sensitive namespaces by default.
+
 
 ## Overview
 
@@ -11,7 +12,14 @@ K8s Sync CLI is designed to simplify the process of replicating resource changes
 ## Features
 
 - **Resource Syncing:**  
-  - Replicates Deployments, StatefulSets, ConfigMaps, Secrets, and PersistentVolumeClaims.
+  Replicates the following Kubernetes resource types:
+    - Deployments
+    - StatefulSets
+    - ConfigMaps
+    - Secrets
+    - PersistentVolumeClaims (PVCs)
+    - Services
+    - Ingresses
   - Supports both continuous watch and one-time sync modes.
   
 - **Namespace Filtering:**  
@@ -30,27 +38,9 @@ K8s Sync CLI is designed to simplify the process of replicating resource changes
   - Includes RBAC manifests (to be used with Kubernetes deployments) that allow the application to watch and read resources across multiple namespaces.
   - Built-in authentication using SQLite-backed user accounts with bcrypt password hashing.
 
-## Architecture
+- **SQLite Persistence**  
+  Sync jobs and user accounts are stored in a local SQLite database. Duplicate replication is prevented by computing a unique change key per resource event.
 
-The project is organized into several packages:
-
-- **cmd/k8s-sync:**  
-  Contains the application entrypoint. It parses CLI flags, initializes the database, creates Kubernetes clients, and either starts the watch mode or executes one-time sync.
-
-- **internal/db:**  
-  Contains SQLite database initialization and user management logic.
-
-- **internal/handlers:**  
-  Implements HTTP endpoint handlers for the REST API (login, dashboard, status, user management, retry).
-
-- **internal/k8s:**  
-  Contains Kubernetes client creation, informer setup, and resource replication logic.
-
-- **internal/replicator:**  
-  Manages replication tasks and worker routines for processing queued changes.
-
-- **Prometheus Metrics:**  
-  Metrics for job count, latency, and success/failure rates are collected and exposed via the `/metrics` endpoint.
 
 ## Installation
 
@@ -71,15 +61,18 @@ cd k8s-sync-cli
 go build -o k8s-sync ./cmd/k8s-sync
 ```
 
-### Configuration
+### Configuration & Usage
 
+#### CLI Flags
 The application is configured via CLI flags:
 	•	--primary: Path to the primary cluster’s kubeconfig file.
 	•	--replica-dir: Directory containing kubeconfig files for replica clusters.
 	•	--worker-count: Number of worker goroutines for processing sync tasks.
-	•	--sync-namespaces: Comma-separated list of namespaces to sync. If empty, all non-sensitive namespaces are synced.
+	•	--namespaces: Comma-separated list of namespaces to sync. If empty, all non-sensitive namespaces are synced by default.
 	•	--sync-once: Run one-time sync mode (verbose) and exit.
 	•	--allow-sensitive-namespaces: Allow syncing of sensitive namespaces (names starting with kube).
+	•	--features: Comma-separated list of resource types to sync. Default: deployments,statefulsets,configmaps,secrets,pvcs,services,ingresses (You can override this to sync only specific features.)
+
 
 For example:
 
@@ -91,11 +84,20 @@ For example:
 
 Watch Mode
 
-By default, the application runs in watch mode. It will continuously listen for resource changes on the primary cluster and replicate them to all configured replica clusters.
+By default, the application runs in continuous watch mode. It starts Kubernetes informers for the enabled features and listens for resource changes on the primary cluster. When a change occurs, it replicates the update to each replica cluster asynchronously.
+
+To start in watch mode:
+
+```bash
+./k8s-sync --primary=/path/to/primary.kubeconfig --replica-dir=/path/to/replica/kubeconfigs
+```
+
 
 ### One-Time Sync Mode
 
-To perform a one-time sync (synchronously and verbosely), use the --sync-once flag:
+One-time sync mode immediately replicates all enabled resource types across all (or specified) namespaces. It first lists the namespaces to sync (skipping sensitive ones unless overridden), ensures that each namespace exists on every replica, and then processes each resource type within that namespace. Detailed progress is printed to the CLI.
+
+To run one-time sync mode:
 
 ```bash
 ./k8s-sync --primary=/path/to/primary.kubeconfig --replica-dir=/path/to/replicas --sync-once
@@ -120,8 +122,9 @@ Returns the connectivity status and server version for the primary and replica c
 Allows creation of new user accounts (requires valid credentials).
 	•	GET /retry:
 Allows retrying a failed replication for a specific job on a specified replica (via query parameters jobid and replica).
-	•	/metrics:
-Prometheus metrics endpoint.
+
+### Metrics
+Prometheus metrics (job count, latency, success/failure rates) are exposed via the /metrics endpoint.
 
 ## Testing
 
