@@ -25,6 +25,9 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+
+	// Add pvc api
+	// corev1 "k8s.io/api/core/v1" already imported
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -35,10 +38,12 @@ import (
 
 // Command-line flags.
 var (
-	primaryKubeconfig    = flag.String("primary-kubeconfig", "", "Path to primary kubeconfig file")
-	replicaKubeconfigDir = flag.String("replica-kubeconfig-dir", "", "Directory containing replica kubeconfig files")
-	workerCount          = flag.Int("worker-count", 3, "Number of worker goroutines")
-	syncNamespacesStr    = flag.String("sync-namespaces", "", "Comma-separated list of namespaces to sync. If empty, sync all namespaces.")
+	primaryKubeconfig        = flag.String("primary", "", "Path to primary kubeconfig file")
+	replicaKubeconfigDir     = flag.String("replica-dir", "", "Directory containing replica kubeconfig files")
+	workerCount              = flag.Int("worker-count", 3, "Number of worker goroutines")
+	syncNamespacesStr        = flag.String("sync-namespaces", "", "Comma-separated list of namespaces to sync. If empty, all non-sensitive namespaces will be synced")
+	syncOnce                 = flag.Bool("sync-once", false, "Run one-time sync mode (verbose) and exit")
+	allowSensitiveNamespaces = flag.Bool("allow-sensitive-namespaces", false, "Allow syncing of sensitive namespaces (names starting with 'kube')")
 )
 
 // Global variables.
@@ -48,7 +53,7 @@ var (
 	db                *sql.DB
 	primaryClient     *kubernetes.Clientset
 	replicaClusters   []*kubernetes.Clientset
-	allowedNamespaces map[string]bool
+	allowedNamespaces map[string]bool // if non-nil, restrict to these namespaces
 
 	// jobCache holds replication tasks keyed by job ID.
 	jobCache sync.Map // key: jobID, value: ReplicationTask
@@ -57,7 +62,7 @@ var (
 	failedReplications sync.Map // key: jobID, value: map[int]string
 )
 
-// Prometheus Metrics
+// Prometheus Metrics.
 var (
 	jobsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "sync_jobs_total",
@@ -83,7 +88,7 @@ type ReplicationTask struct {
 	ChangeKey    string // used to prevent re-replication
 }
 
-// User model and login types
+// User model and login types.
 type User struct {
 	Username  string
 	Password  string // stored as bcrypt hash
@@ -105,16 +110,17 @@ type CreateUserRequest struct {
 	Password string `json:"password"`
 }
 
-// Main function
+// ----------------------- Main -----------------------
+
 func main() {
 	flag.Parse()
 
 	if *primaryKubeconfig == "" {
-		fmt.Println("primary-kubeconfig flag is required")
+		fmt.Println("primary flag is required")
 		os.Exit(1)
 	}
 
-	// Build allowed namespaces map if provided.
+	// Build allowedNamespaces from flag syncNamespacesStr if provided.
 	if *syncNamespacesStr != "" {
 		allowedNamespaces = make(map[string]bool)
 		for _, ns := range strings.Split(*syncNamespacesStr, ",") {
@@ -122,13 +128,13 @@ func main() {
 		}
 	}
 
-	// Initialize SQLite (includes tables for jobs and users).
+	// Initialize SQLite.
 	if err := initDB("sync_jobs.db"); err != nil {
 		fmt.Printf("Failed to initialize SQLite DB: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Check for admin user; if not found, create one.
+	// Ensure admin user exists.
 	ensureAdminUser()
 
 	// Initialize work queue.
@@ -142,7 +148,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Load replica clusters from the provided directory.
+	// Load replica clusters.
 	replicaClusters, err = loadReplicaClustersConfig(*replicaKubeconfigDir)
 	if err != nil {
 		fmt.Printf("Error loading replica clusters: %v\n", err)
@@ -158,26 +164,36 @@ func main() {
 	http.HandleFunc("/api/login", loginHandler)
 	http.HandleFunc("/api/dashboard", dashboardHandler)
 	http.HandleFunc("/api/status", statusHandlerAPI)
-	http.HandleFunc("/api/users", createUserHandler) // POST to add a user
-	http.HandleFunc("/retry", retryHandler)          // already implemented earlier
+	http.HandleFunc("/api/users", createUserHandler)
+	http.HandleFunc("/retry", retryHandler)
 
-	// Start replication informers.
+	// If --sync-once is specified, run one-time sync and exit.
+	if *syncOnce {
+		err = oneTimeSync()
+		if err != nil {
+			fmt.Printf("One-time sync encountered errors: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("One-time sync completed successfully. Exiting.")
+		os.Exit(0)
+	}
+
+	// Otherwise, start continuous watch mode.
 	factory := informers.NewSharedInformerFactory(primaryClient, time.Minute)
 	setupDeploymentInformer(factory)
 	setupStatefulSetInformer(factory)
 	setupSecretInformer(factory)
 	setupConfigMapInformer(factory)
+	setupPVCInformer(factory) // new: PVC informer
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	factory.Start(stopCh)
 	factory.WaitForCacheSync(stopCh)
 
-	// Start worker goroutines.
-	for range *workerCount {
+	for i := 0; i < *workerCount; i++ {
 		go worker()
 	}
 
-	// Start HTTP server.
 	go func() {
 		fmt.Println("HTTP endpoints listening on :8080")
 		if err := http.ListenAndServe(":8080", nil); err != nil {
@@ -185,7 +201,6 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
@@ -193,11 +208,274 @@ func main() {
 	workQueue.ShutDown()
 }
 
-//
-// Change Key & Duplication Prevention
-//
+// ---------------- One-Time Sync Mode ----------------
 
-// getChangeKey generates a key for the change so that already replicated changes can be skipped.
+// oneTimeSync lists all namespaces to be synced (filtering out sensitive ones unless allowed)
+// and then for each namespace ensures it exists on replica clusters and syncs resources.
+func oneTimeSync() error {
+	fmt.Println("Starting one-time sync mode...")
+	// List namespaces from primary.
+	nsList, err := primaryClient.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	var syncNamespaces []string
+	for _, ns := range nsList.Items {
+		// If allowedNamespaces map is provided, use that.
+		if allowedNamespaces != nil {
+			if !allowedNamespaces[ns.Name] {
+				continue
+			}
+		} else {
+			// Otherwise, by default skip namespaces that start with "kube"
+			if strings.HasPrefix(ns.Name, "kube") && !*allowSensitiveNamespaces {
+				continue
+			}
+		}
+		syncNamespaces = append(syncNamespaces, ns.Name)
+	}
+
+	if len(syncNamespaces) == 0 {
+		fmt.Println("No namespaces to sync.")
+		return nil
+	}
+
+	// For each namespace, ensure the namespace exists on each replica, then sync resources.
+	for _, ns := range syncNamespaces {
+		fmt.Printf("Processing namespace: %s\n", ns)
+		// Ensure namespace exists on each replica.
+		for idx, replica := range replicaClusters {
+			err := ensureNamespace(replica, ns)
+			if err != nil {
+				fmt.Printf("Error ensuring namespace %s in replica %d: %v\n", ns, idx+1, err)
+				continue
+			}
+		}
+		// Sync resources in this namespace.
+		if err := syncDeploymentsInNamespace(ns); err != nil {
+			fmt.Printf("Error syncing deployments in namespace %s: %v\n", ns, err)
+		}
+		if err := syncStatefulSetsInNamespace(ns); err != nil {
+			fmt.Printf("Error syncing statefulsets in namespace %s: %v\n", ns, err)
+		}
+		if err := syncConfigMapsInNamespace(ns); err != nil {
+			fmt.Printf("Error syncing configmaps in namespace %s: %v\n", ns, err)
+		}
+		if err := syncSecretsInNamespace(ns); err != nil {
+			fmt.Printf("Error syncing secrets in namespace %s: %v\n", ns, err)
+		}
+		if err := syncPVCsInNamespace(ns); err != nil {
+			fmt.Printf("Error syncing PVCs in namespace %s: %v\n", ns, err)
+		}
+	}
+
+	return nil
+}
+
+// ensureNamespace ensures that a namespace exists in a given replica cluster.
+func ensureNamespace(replica *kubernetes.Clientset, ns string) error {
+	_, err := replica.CoreV1().Namespaces().Get(context.TODO(), ns, metav1.GetOptions{})
+	if err == nil {
+		return nil // exists
+	}
+	// Create the namespace.
+	newNS := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: ns,
+		},
+	}
+	_, err = replica.CoreV1().Namespaces().Create(context.TODO(), newNS, metav1.CreateOptions{})
+	return err
+}
+
+// Sync functions per namespace.
+func syncDeploymentsInNamespace(namespace string) error {
+	fmt.Printf("Syncing Deployments in namespace %s...\n", namespace)
+	depList, err := primaryClient.AppsV1().Deployments(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	total := len(depList.Items)
+	fmt.Printf("Found %d deployments in %s\n", total, namespace)
+	for i, dep := range depList.Items {
+		fmt.Printf("Deployment [%d/%d]: %s\n", i+1, total, dep.Name)
+		for idx, replica := range replicaClusters {
+			fmt.Printf("  Replica %d: ", idx+1)
+			err := replicateDeploymentToReplica(&dep, replica)
+			if err != nil {
+				fmt.Printf("Failed: %v\n", err)
+			} else {
+				fmt.Println("Succeeded")
+			}
+		}
+	}
+	return nil
+}
+
+func syncStatefulSetsInNamespace(namespace string) error {
+	fmt.Printf("Syncing StatefulSets in namespace %s...\n", namespace)
+	stsList, err := primaryClient.AppsV1().StatefulSets(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	total := len(stsList.Items)
+	fmt.Printf("Found %d statefulsets in %s\n", total, namespace)
+	for i, sts := range stsList.Items {
+		fmt.Printf("StatefulSet [%d/%d]: %s\n", i+1, total, sts.Name)
+		for idx, replica := range replicaClusters {
+			fmt.Printf("  Replica %d: ", idx+1)
+			err := replicateStatefulSetToReplica(&sts, replica)
+			if err != nil {
+				fmt.Printf("Failed: %v\n", err)
+			} else {
+				fmt.Println("Succeeded")
+			}
+		}
+	}
+	return nil
+}
+
+func syncConfigMapsInNamespace(namespace string) error {
+	fmt.Printf("Syncing ConfigMaps in namespace %s...\n", namespace)
+	cmList, err := primaryClient.CoreV1().ConfigMaps(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	total := len(cmList.Items)
+	fmt.Printf("Found %d configmaps in %s\n", total, namespace)
+	for i, cm := range cmList.Items {
+		fmt.Printf("ConfigMap [%d/%d]: %s\n", i+1, total, cm.Name)
+		if strings.HasPrefix(cm.Name, "kube") && !*allowSensitiveNamespaces {
+			fmt.Printf("Skipping configmap %s\n", cm.Name)
+			continue
+		}
+		for idx, replica := range replicaClusters {
+			fmt.Printf("  Replica %d: ", idx+1)
+			err := replicateConfigMapToReplica(&cm, replica)
+			if err != nil {
+				fmt.Printf("Failed: %v\n", err)
+			} else {
+				fmt.Println("Succeeded")
+			}
+		}
+	}
+	return nil
+}
+
+func syncSecretsInNamespace(namespace string) error {
+	fmt.Printf("Syncing Secrets in namespace %s...\n", namespace)
+	secretList, err := primaryClient.CoreV1().Secrets(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	total := len(secretList.Items)
+	fmt.Printf("Found %d secrets in %s\n", total, namespace)
+	for i, secret := range secretList.Items {
+		if strings.HasPrefix(secret.Name, "default-token-") {
+			continue
+		}
+		fmt.Printf("Secret [%d/%d]: %s\n", i+1, total, secret.Name)
+		for idx, replica := range replicaClusters {
+			fmt.Printf("  Replica %d: ", idx+1)
+			err := replicateSecretToReplica(&secret, replica)
+			if err != nil {
+				fmt.Printf("Failed: %v\n", err)
+			} else {
+				fmt.Println("Succeeded")
+			}
+		}
+	}
+	return nil
+}
+
+func syncPVCsInNamespace(namespace string) error {
+	fmt.Printf("Syncing PersistentVolumeClaims in namespace %s...\n", namespace)
+	pvcList, err := primaryClient.CoreV1().PersistentVolumeClaims(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	total := len(pvcList.Items)
+	fmt.Printf("Found %d PVCs in %s\n", total, namespace)
+	for i, pvc := range pvcList.Items {
+		fmt.Printf("PVC [%d/%d]: %s\n", i+1, total, pvc.Name)
+		for idx, replica := range replicaClusters {
+			fmt.Printf("  Replica %d: ", idx+1)
+			err := replicatePVCToReplica(&pvc, replica)
+			if err != nil {
+				fmt.Printf("Failed: %v\n", err)
+			} else {
+				fmt.Println("Succeeded")
+			}
+		}
+	}
+	return nil
+}
+
+// Helper replication functions for one-time sync.
+func replicateDeploymentToReplica(dep *appsv1.Deployment, replica *kubernetes.Clientset) error {
+	existing, err := replica.AppsV1().Deployments(dep.Namespace).Get(context.TODO(), dep.Name, metav1.GetOptions{})
+	if err != nil {
+		dep.ResourceVersion = ""
+		_, err = replica.AppsV1().Deployments(dep.Namespace).Create(context.TODO(), dep, metav1.CreateOptions{})
+		return err
+	}
+	dep.ResourceVersion = existing.ResourceVersion
+	_, err = replica.AppsV1().Deployments(dep.Namespace).Update(context.TODO(), dep, metav1.UpdateOptions{})
+	return err
+}
+
+func replicateStatefulSetToReplica(sts *appsv1.StatefulSet, replica *kubernetes.Clientset) error {
+	existing, err := replica.AppsV1().StatefulSets(sts.Namespace).Get(context.TODO(), sts.Name, metav1.GetOptions{})
+	if err != nil {
+		sts.ResourceVersion = ""
+		_, err = replica.AppsV1().StatefulSets(sts.Namespace).Create(context.TODO(), sts, metav1.CreateOptions{})
+		return err
+	}
+	sts.ResourceVersion = existing.ResourceVersion
+	_, err = replica.AppsV1().StatefulSets(sts.Namespace).Update(context.TODO(), sts, metav1.UpdateOptions{})
+	return err
+}
+
+func replicateConfigMapToReplica(cm *corev1.ConfigMap, replica *kubernetes.Clientset) error {
+	existing, err := replica.CoreV1().ConfigMaps(cm.Namespace).Get(context.TODO(), cm.Name, metav1.GetOptions{})
+	if err != nil {
+		cm.ResourceVersion = ""
+		_, err = replica.CoreV1().ConfigMaps(cm.Namespace).Create(context.TODO(), cm, metav1.CreateOptions{})
+		return err
+	}
+	cm.ResourceVersion = existing.ResourceVersion
+	_, err = replica.CoreV1().ConfigMaps(cm.Namespace).Update(context.TODO(), cm, metav1.UpdateOptions{})
+	return err
+}
+
+func replicateSecretToReplica(secret *corev1.Secret, replica *kubernetes.Clientset) error {
+	existing, err := replica.CoreV1().Secrets(secret.Namespace).Get(context.TODO(), secret.Name, metav1.GetOptions{})
+	if err != nil {
+		secret.ResourceVersion = ""
+		_, err = replica.CoreV1().Secrets(secret.Namespace).Create(context.TODO(), secret, metav1.CreateOptions{})
+		return err
+	}
+	secret.ResourceVersion = existing.ResourceVersion
+	_, err = replica.CoreV1().Secrets(secret.Namespace).Update(context.TODO(), secret, metav1.UpdateOptions{})
+	return err
+}
+
+func replicatePVCToReplica(pvc *corev1.PersistentVolumeClaim, replica *kubernetes.Clientset) error {
+	existing, err := replica.CoreV1().PersistentVolumeClaims(pvc.Namespace).Get(context.TODO(), pvc.Name, metav1.GetOptions{})
+	if err != nil {
+		pvc.ResourceVersion = ""
+		_, err = replica.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(context.TODO(), pvc, metav1.CreateOptions{})
+		return err
+	}
+	pvc.ResourceVersion = existing.ResourceVersion
+	_, err = replica.CoreV1().PersistentVolumeClaims(pvc.Namespace).Update(context.TODO(), pvc, metav1.UpdateOptions{})
+	return err
+}
+
+// ------------------ Helper Functions ------------------
+
+// getChangeKey generates a key for a resource change.
 func getChangeKey(resourceType, namespace, name, operation string, obj interface{}) string {
 	if operation == "delete" {
 		return fmt.Sprintf("%s:%s:%s:delete", resourceType, namespace, name)
@@ -220,11 +498,15 @@ func getChangeKey(resourceType, namespace, name, operation string, obj interface
 		if cm, ok := obj.(*corev1.ConfigMap); ok {
 			resourceVersion = cm.ResourceVersion
 		}
+	case "pvc":
+		if pvc, ok := obj.(*corev1.PersistentVolumeClaim); ok {
+			resourceVersion = pvc.ResourceVersion
+		}
 	}
 	return fmt.Sprintf("%s:%s:%s:%s", resourceType, namespace, name, resourceVersion)
 }
 
-// alreadyReplicated checks in the SQLite DB if a change with the given key was already successfully replicated.
+// alreadyReplicated checks if a resource with the given change key was already synced.
 func alreadyReplicated(changeKey string) (bool, error) {
 	row := db.QueryRow("SELECT COUNT(*) FROM jobs WHERE change_key = ? AND status = 'Completed'", changeKey)
 	var count int
@@ -234,9 +516,7 @@ func alreadyReplicated(changeKey string) (bool, error) {
 	return count > 0, nil
 }
 
-//
-// SQLite Functions
-//
+// ------------------ SQLite Functions ------------------
 
 func initDB(dbPath string) error {
 	var err error
@@ -244,7 +524,6 @@ func initDB(dbPath string) error {
 	if err != nil {
 		return err
 	}
-	// Create jobs table.
 	createJobsTableSQL := `CREATE TABLE IF NOT EXISTS jobs (
 		id TEXT PRIMARY KEY,
 		change_key TEXT,
@@ -262,7 +541,6 @@ func initDB(dbPath string) error {
 	if _, err := db.Exec(createJobsTableSQL); err != nil {
 		return err
 	}
-	// Create users table.
 	createUsersTableSQL := `CREATE TABLE IF NOT EXISTS users (
 		username TEXT PRIMARY KEY,
 		password TEXT,
@@ -296,7 +574,6 @@ func ensureAdminUser() {
 		return
 	}
 	if count == 0 {
-		// Generate a random password.
 		pass := uuid.New().String()[0:8]
 		hashed, err := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
 		if err != nil {
@@ -312,11 +589,8 @@ func ensureAdminUser() {
 	}
 }
 
-//
-// API Endpoints
-//
+// ------------------ API Endpoints ------------------
 
-// loginHandler handles POST /api/login.
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
@@ -327,27 +601,22 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
-	// Look up user.
 	var storedHash string
 	err := db.QueryRow("SELECT password FROM users WHERE username = ?", req.Username).Scan(&storedHash)
 	if err != nil {
 		http.Error(w, `{"success": false, "message": "User not found"}`, http.StatusUnauthorized)
 		return
 	}
-	// Compare passwords.
 	if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(req.Password)); err != nil {
 		http.Error(w, `{"success": false, "message": "Invalid credentials"}`, http.StatusUnauthorized)
 		return
 	}
-	// On successful login, return success (in a real system, you would issue a session or JWT token).
 	resp := LoginResponse{Success: true}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-// dashboardHandler handles GET /api/dashboard.
 func dashboardHandler(w http.ResponseWriter, r *http.Request) {
-	// Query aggregate data from jobs table.
 	var total, ongoing, failed, pending int
 	if err := db.QueryRow("SELECT COUNT(*) FROM jobs").Scan(&total); err != nil {
 		http.Error(w, "Error querying total jobs", http.StatusInternalServerError)
@@ -380,7 +649,6 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(data)
 }
 
-// statusHandlerAPI handles GET /api/status.
 func statusHandlerAPI(w http.ResponseWriter, r *http.Request) {
 	type ClusterStatus struct {
 		Status        string `json:"status"`
@@ -391,13 +659,11 @@ func statusHandlerAPI(w http.ResponseWriter, r *http.Request) {
 		Primary  ClusterStatus   `json:"primary"`
 		Replicas []ClusterStatus `json:"replicas"`
 	}{}
-	// Check primary.
 	if ver, err := primaryClient.Discovery().ServerVersion(); err != nil {
 		resp.Primary = ClusterStatus{Status: "failed", Error: err.Error()}
 	} else {
 		resp.Primary = ClusterStatus{Status: "ok", ServerVersion: ver.GitVersion}
 	}
-	// Check replicas.
 	for _, replica := range replicaClusters {
 		var cs ClusterStatus
 		if ver, err := replica.Discovery().ServerVersion(); err != nil {
@@ -411,7 +677,6 @@ func statusHandlerAPI(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// createUserHandler handles POST /api/users to add a new user.
 func createUserHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
@@ -422,7 +687,6 @@ func createUserHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
-	// Check if user already exists.
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM users WHERE username = ?", req.Username).Scan(&count)
 	if err != nil {
@@ -448,8 +712,6 @@ func createUserHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// Retry endpoint (already implemented earlier) remains unchanged.
-// It expects query parameters: jobid and replica (index).
 func retryHandler(w http.ResponseWriter, r *http.Request) {
 	jobID := r.URL.Query().Get("jobid")
 	replicaIdxStr := r.URL.Query().Get("replica")
@@ -468,7 +730,6 @@ func retryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	task := val.(ReplicationTask)
-	// Attempt replication for the specified replica.
 	err = replicateToReplica(task, replicaClusters[replicaIdx])
 	if err != nil {
 		updateFailure(jobID, replicaIdx, err.Error())
@@ -487,9 +748,7 @@ func ptrTime(t time.Time) *time.Time {
 	return &t
 }
 
-//
-// Helpers for Failure Tracking
-//
+// ------------------ Failure Tracking Helpers ------------------
 
 func updateFailure(jobID string, replicaIdx int, msg string) {
 	var failures map[int]string
@@ -518,9 +777,7 @@ func noFailures(jobID string) bool {
 	return !ok
 }
 
-//
-// Kubernetes Client Functions
-//
+// ------------------ Kubernetes Client Functions ------------------
 
 func getKubeClient(kubeconfigPath string) (*kubernetes.Clientset, error) {
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
@@ -560,22 +817,20 @@ func loadReplicaClustersConfig(dir string) ([]*kubernetes.Clientset, error) {
 	return clusters, nil
 }
 
-// Task Enqueue & Processing (Replication Logic)
+// ------------------ Task Enqueue & Processing (Replication Logic) ------------------
+
 func enqueueReplicationTask(resourceType, namespace, name, operation string, obj interface{}) {
 	if !shouldSync(namespace) {
 		return
 	}
-
 	changeKey := getChangeKey(resourceType, namespace, name, operation, obj)
 	already, err := alreadyReplicated(changeKey)
 	if err != nil {
 		fmt.Printf("Error checking duplication: %v\n", err)
 	}
 	if already {
-		// Skip already replicated change.
 		return
 	}
-
 	task := ReplicationTask{
 		ResourceType: resourceType,
 		Namespace:    namespace,
@@ -619,7 +874,6 @@ func processReplicationTask(task ReplicationTask) {
 	var mu sync.Mutex
 	jobFailed := false
 	var errorMsg string
-	// local map to track failures for this task.
 	localFailures := make(map[int]string)
 
 	for idx, replica := range replicaClusters {
@@ -644,7 +898,6 @@ func processReplicationTask(task ReplicationTask) {
 	if len(localFailures) > 0 {
 		failedReplications.Store(task.TaskID, localFailures)
 	}
-
 	finishTime := time.Now()
 	duration := finishTime.Sub(startTime).Seconds()
 	jobLatency.Observe(duration)
@@ -688,6 +941,12 @@ func replicateToReplica(task ReplicationTask, replica *kubernetes.Clientset) err
 			return fmt.Errorf("object type assertion to ConfigMap failed")
 		}
 		return replicateConfigMap(task, cm, replica)
+	case "pvc":
+		pvc, ok := task.Object.(*corev1.PersistentVolumeClaim)
+		if !ok {
+			return fmt.Errorf("object type assertion to PVC failed")
+		}
+		return replicatePVC(task, pvc, replica)
 	default:
 		return fmt.Errorf("unsupported resource type: %s", task.ResourceType)
 	}
@@ -723,21 +982,6 @@ func replicateStatefulSet(task ReplicationTask, sts *appsv1.StatefulSet, replica
 	return err
 }
 
-func replicateSecret(task ReplicationTask, secret *corev1.Secret, replica *kubernetes.Clientset) error {
-	if task.Operation == "delete" {
-		return replica.CoreV1().Secrets(task.Namespace).Delete(context.TODO(), task.Name, metav1.DeleteOptions{})
-	}
-	existing, err := replica.CoreV1().Secrets(task.Namespace).Get(context.TODO(), task.Name, metav1.GetOptions{})
-	if err != nil {
-		secret.ResourceVersion = ""
-		_, err = replica.CoreV1().Secrets(task.Namespace).Create(context.TODO(), secret, metav1.CreateOptions{})
-		return err
-	}
-	secret.ResourceVersion = existing.ResourceVersion
-	_, err = replica.CoreV1().Secrets(task.Namespace).Update(context.TODO(), secret, metav1.UpdateOptions{})
-	return err
-}
-
 func replicateConfigMap(task ReplicationTask, cm *corev1.ConfigMap, replica *kubernetes.Clientset) error {
 	if task.Operation == "delete" {
 		return replica.CoreV1().ConfigMaps(task.Namespace).Delete(context.TODO(), task.Name, metav1.DeleteOptions{})
@@ -753,6 +997,36 @@ func replicateConfigMap(task ReplicationTask, cm *corev1.ConfigMap, replica *kub
 	return err
 }
 
+func replicateSecret(task ReplicationTask, secret *corev1.Secret, replica *kubernetes.Clientset) error {
+	if task.Operation == "delete" {
+		return replica.CoreV1().Secrets(task.Namespace).Delete(context.TODO(), task.Name, metav1.DeleteOptions{})
+	}
+	existing, err := replica.CoreV1().Secrets(task.Namespace).Get(context.TODO(), task.Name, metav1.GetOptions{})
+	if err != nil {
+		secret.ResourceVersion = ""
+		_, err = replica.CoreV1().Secrets(task.Namespace).Create(context.TODO(), secret, metav1.CreateOptions{})
+		return err
+	}
+	secret.ResourceVersion = existing.ResourceVersion
+	_, err = replica.CoreV1().Secrets(task.Namespace).Update(context.TODO(), secret, metav1.UpdateOptions{})
+	return err
+}
+
+func replicatePVC(task ReplicationTask, pvc *corev1.PersistentVolumeClaim, replica *kubernetes.Clientset) error {
+	if task.Operation == "delete" {
+		return replica.CoreV1().PersistentVolumeClaims(task.Namespace).Delete(context.TODO(), task.Name, metav1.DeleteOptions{})
+	}
+	existing, err := replica.CoreV1().PersistentVolumeClaims(task.Namespace).Get(context.TODO(), task.Name, metav1.GetOptions{})
+	if err != nil {
+		pvc.ResourceVersion = ""
+		_, err = replica.CoreV1().PersistentVolumeClaims(task.Namespace).Create(context.TODO(), pvc, metav1.CreateOptions{})
+		return err
+	}
+	pvc.ResourceVersion = existing.ResourceVersion
+	_, err = replica.CoreV1().PersistentVolumeClaims(task.Namespace).Update(context.TODO(), pvc, metav1.UpdateOptions{})
+	return err
+}
+
 func generateTaskID() string {
 	return uuid.New().String()
 }
@@ -761,11 +1035,8 @@ func updateTaskProgress(taskID, status string) {
 	progressMap.Store(taskID, status)
 }
 
-//
-// HTTP Handlers for Frontend
-//
+// ------------------ HTTP Handler for Progress ------------------
 
-// progressHandler shows the replication tasks and their statuses.
 func progressHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Replication Tasks Progress:\n")
 	progressMap.Range(func(key, value interface{}) bool {
@@ -774,9 +1045,7 @@ func progressHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-//
-// Informer Setup Functions
-//
+// ------------------ Informer Setup Functions ------------------
 
 func setupDeploymentInformer(factory informers.SharedInformerFactory) {
 	informer := factory.Apps().V1().Deployments().Informer()
@@ -882,19 +1151,41 @@ func setupConfigMapInformer(factory informers.SharedInformerFactory) {
 	})
 }
 
-// shouldSync returns true if the given namespace is allowed for syncing.
-func shouldSync(namespace string) bool {
-	if allowedNamespaces == nil {
-		return true
-	}
-	return allowedNamespaces[namespace]
+func setupPVCInformer(factory informers.SharedInformerFactory) {
+	informer := factory.Core().V1().PersistentVolumeClaims().Informer()
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			pvc := obj.(*corev1.PersistentVolumeClaim)
+			enqueueReplicationTask("pvc", pvc.Namespace, pvc.Name, "add", pvc)
+		},
+		UpdateFunc: func(old, new interface{}) {
+			pvc := new.(*corev1.PersistentVolumeClaim)
+			enqueueReplicationTask("pvc", pvc.Namespace, pvc.Name, "update", pvc)
+		},
+		DeleteFunc: func(obj interface{}) {
+			var pvc *corev1.PersistentVolumeClaim
+			switch t := obj.(type) {
+			case *corev1.PersistentVolumeClaim:
+				pvc = t
+			case cache.DeletedFinalStateUnknown:
+				pvc = t.Obj.(*corev1.PersistentVolumeClaim)
+			}
+			if pvc != nil {
+				enqueueReplicationTask("pvc", pvc.Namespace, pvc.Name, "delete", pvc)
+			}
+		},
+	})
 }
 
-// Log panics.
-// func init() {
-// 	runtime.ErrorHandlers = []func(error){
-// 		func(err error) {
-// 			fmt.Printf("Runtime error: %v\n", err)
-// 		},
-// 	}
-// }
+// ------------------ Helper: shouldSync ------------------
+// If allowedNamespaces map is set, only sync those namespaces.
+// Otherwise, skip any namespace whose name starts with "kube" unless allowSensitiveNamespaces is true.
+func shouldSync(namespace string) bool {
+	if allowedNamespaces != nil {
+		return allowedNamespaces[namespace]
+	}
+	if strings.HasPrefix(namespace, "kube") && !*allowSensitiveNamespaces {
+		return false
+	}
+	return true
+}
