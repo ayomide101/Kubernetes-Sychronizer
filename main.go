@@ -25,9 +25,8 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 
-	// Add pvc api
-	// corev1 "k8s.io/api/core/v1" already imported
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -44,6 +43,7 @@ var (
 	syncNamespacesStr        = flag.String("namespaces", "", "Comma-separated list of namespaces to sync. If empty, all non-sensitive namespaces will be synced")
 	syncOnce                 = flag.Bool("sync-once", false, "Run one-time sync mode (verbose) and exit")
 	allowSensitiveNamespaces = flag.Bool("allow-sensitive-namespaces", false, "Allow syncing of sensitive namespaces (names starting with 'kube')")
+	syncFeaturesStr          = flag.String("features", "deployments,statefulsets,configmaps,secrets,pvcs,services,ingresses", "Comma-separated list of features to sync (e.g. deployments, statefulsets, configmaps, secrets, pvcs, services, ingresses)")
 )
 
 // Global variables.
@@ -54,6 +54,9 @@ var (
 	primaryClient     *kubernetes.Clientset
 	replicaClusters   []*kubernetes.Clientset
 	allowedNamespaces map[string]bool // if non-nil, restrict to these namespaces
+
+	// syncFeatures holds the resource types to sync.
+	syncFeatures map[string]bool
 
 	// jobCache holds replication tasks keyed by job ID.
 	jobCache sync.Map // key: jobID, value: ReplicationTask
@@ -120,6 +123,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Parse sync-features flag.
+	syncFeatures = make(map[string]bool)
+	for _, f := range strings.Split(*syncFeaturesStr, ",") {
+		syncFeatures[strings.TrimSpace(strings.ToLower(f))] = true
+	}
+
 	// Build allowedNamespaces from flag syncNamespacesStr if provided.
 	if *syncNamespacesStr != "" {
 		allowedNamespaces = make(map[string]bool)
@@ -180,11 +189,27 @@ func main() {
 
 	// Otherwise, start continuous watch mode.
 	factory := informers.NewSharedInformerFactory(primaryClient, time.Minute)
-	setupDeploymentInformer(factory)
-	setupStatefulSetInformer(factory)
-	setupSecretInformer(factory)
-	setupConfigMapInformer(factory)
-	setupPVCInformer(factory) // new: PVC informer
+	if syncFeatures["deployments"] {
+		setupDeploymentInformer(factory)
+	}
+	if syncFeatures["statefulsets"] {
+		setupStatefulSetInformer(factory)
+	}
+	if syncFeatures["configmaps"] {
+		setupConfigMapInformer(factory)
+	}
+	if syncFeatures["secrets"] {
+		setupSecretInformer(factory)
+	}
+	if syncFeatures["pvcs"] {
+		setupPVCInformer(factory)
+	}
+	if syncFeatures["services"] {
+		setupServiceInformer(factory)
+	}
+	if syncFeatures["ingresses"] {
+		setupIngressInformer(factory)
+	}
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	factory.Start(stopCh)
@@ -210,8 +235,8 @@ func main() {
 
 // ---------------- One-Time Sync Mode ----------------
 
-// oneTimeSync lists all namespaces to be synced (filtering out sensitive ones unless allowed)
-// and then for each namespace ensures it exists on replica clusters and syncs resources.
+// oneTimeSync lists namespaces to sync (filtering out sensitive ones unless allowed),
+// ensures they exist on replicas, and then per-namespace syncs the selected features.
 func oneTimeSync() error {
 	fmt.Println("Starting one-time sync mode...")
 	// List namespaces from primary.
@@ -222,13 +247,11 @@ func oneTimeSync() error {
 
 	var syncNamespaces []string
 	for _, ns := range nsList.Items {
-		// If allowedNamespaces map is provided, use that.
 		if allowedNamespaces != nil {
 			if !allowedNamespaces[ns.Name] {
 				continue
 			}
 		} else {
-			// Otherwise, by default skip namespaces that start with "kube"
 			if strings.HasPrefix(ns.Name, "kube") && !*allowSensitiveNamespaces {
 				continue
 			}
@@ -241,10 +264,8 @@ func oneTimeSync() error {
 		return nil
 	}
 
-	// For each namespace, ensure the namespace exists on each replica, then sync resources.
 	for _, ns := range syncNamespaces {
 		fmt.Printf("Processing namespace: %s\n", ns)
-		// Ensure namespace exists on each replica.
 		for idx, replica := range replicaClusters {
 			err := ensureNamespace(replica, ns)
 			if err != nil {
@@ -252,34 +273,52 @@ func oneTimeSync() error {
 				continue
 			}
 		}
-		// Sync resources in this namespace.
-		if err := syncDeploymentsInNamespace(ns); err != nil {
-			fmt.Printf("Error syncing deployments in namespace %s: %v\n", ns, err)
+		if syncFeatures["deployments"] {
+			if err := syncDeploymentsInNamespace(ns); err != nil {
+				fmt.Printf("Error syncing deployments in namespace %s: %v\n", ns, err)
+			}
 		}
-		if err := syncStatefulSetsInNamespace(ns); err != nil {
-			fmt.Printf("Error syncing statefulsets in namespace %s: %v\n", ns, err)
+		if syncFeatures["statefulsets"] {
+			if err := syncStatefulSetsInNamespace(ns); err != nil {
+				fmt.Printf("Error syncing statefulsets in namespace %s: %v\n", ns, err)
+			}
 		}
-		if err := syncConfigMapsInNamespace(ns); err != nil {
-			fmt.Printf("Error syncing configmaps in namespace %s: %v\n", ns, err)
+		if syncFeatures["configmaps"] {
+			if err := syncConfigMapsInNamespace(ns); err != nil {
+				fmt.Printf("Error syncing configmaps in namespace %s: %v\n", ns, err)
+			}
 		}
-		if err := syncSecretsInNamespace(ns); err != nil {
-			fmt.Printf("Error syncing secrets in namespace %s: %v\n", ns, err)
+		if syncFeatures["secrets"] {
+			if err := syncSecretsInNamespace(ns); err != nil {
+				fmt.Printf("Error syncing secrets in namespace %s: %v\n", ns, err)
+			}
 		}
-		if err := syncPVCsInNamespace(ns); err != nil {
-			fmt.Printf("Error syncing PVCs in namespace %s: %v\n", ns, err)
+		if syncFeatures["pvcs"] {
+			if err := syncPVCsInNamespace(ns); err != nil {
+				fmt.Printf("Error syncing PVCs in namespace %s: %v\n", ns, err)
+			}
+		}
+		if syncFeatures["services"] {
+			if err := syncServicesInNamespace(ns); err != nil {
+				fmt.Printf("Error syncing services in namespace %s: %v\n", ns, err)
+			}
+		}
+		if syncFeatures["ingresses"] {
+			if err := syncIngressesInNamespace(ns); err != nil {
+				fmt.Printf("Error syncing ingresses in namespace %s: %v\n", ns, err)
+			}
 		}
 	}
 
 	return nil
 }
 
-// ensureNamespace ensures that a namespace exists in a given replica cluster.
+// ensureNamespace ensures a namespace exists in a replica.
 func ensureNamespace(replica *kubernetes.Clientset, ns string) error {
 	_, err := replica.CoreV1().Namespaces().Get(context.TODO(), ns, metav1.GetOptions{})
 	if err == nil {
-		return nil // exists
+		return nil
 	}
-	// Create the namespace.
 	newNS := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: ns,
@@ -412,7 +451,54 @@ func syncPVCsInNamespace(namespace string) error {
 	return nil
 }
 
-// Helper replication functions for one-time sync.
+func syncServicesInNamespace(namespace string) error {
+	fmt.Printf("Syncing Services in namespace %s...\n", namespace)
+	svcList, err := primaryClient.CoreV1().Services(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	total := len(svcList.Items)
+	fmt.Printf("Found %d services in %s\n", total, namespace)
+	for i, svc := range svcList.Items {
+		fmt.Printf("Service [%d/%d]: %s\n", i+1, total, svc.Name)
+		for idx, replica := range replicaClusters {
+			fmt.Printf("  Replica %d: ", idx+1)
+			err := replicateServiceToReplica(&svc, replica)
+			if err != nil {
+				fmt.Printf("Failed: %v\n", err)
+			} else {
+				fmt.Println("Succeeded")
+			}
+		}
+	}
+	return nil
+}
+
+func syncIngressesInNamespace(namespace string) error {
+	fmt.Printf("Syncing Ingresses in namespace %s...\n", namespace)
+	ingList, err := primaryClient.NetworkingV1().Ingresses(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	total := len(ingList.Items)
+	fmt.Printf("Found %d ingresses in %s\n", total, namespace)
+	for i, ing := range ingList.Items {
+		fmt.Printf("Ingress [%d/%d]: %s\n", i+1, total, ing.Name)
+		for idx, replica := range replicaClusters {
+			fmt.Printf("  Replica %d: ", idx+1)
+			err := replicateIngressToReplica(&ing, replica)
+			if err != nil {
+				fmt.Printf("Failed: %v\n", err)
+			} else {
+				fmt.Println("Succeeded")
+			}
+		}
+	}
+	return nil
+}
+
+// ------------------ Helper Replication Functions for One-Time Sync ------------------
+
 func replicateDeploymentToReplica(dep *appsv1.Deployment, replica *kubernetes.Clientset) error {
 	existing, err := replica.AppsV1().Deployments(dep.Namespace).Get(context.TODO(), dep.Name, metav1.GetOptions{})
 	if err != nil {
@@ -473,6 +559,31 @@ func replicatePVCToReplica(pvc *corev1.PersistentVolumeClaim, replica *kubernete
 	return err
 }
 
+func replicateServiceToReplica(svc *corev1.Service, replica *kubernetes.Clientset) error {
+	existing, err := replica.CoreV1().Services(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
+	if err != nil {
+		svc.ResourceVersion = ""
+		_, err = replica.CoreV1().Services(svc.Namespace).Create(context.TODO(), svc, metav1.CreateOptions{})
+		return err
+	}
+	svc.ResourceVersion = existing.ResourceVersion
+	_, err = replica.CoreV1().Services(svc.Namespace).Update(context.TODO(), svc, metav1.UpdateOptions{})
+	return err
+}
+
+func replicateIngressToReplica(ing *networkingv1.Ingress, replica *kubernetes.Clientset) error {
+	existing, err := replica.NetworkingV1().Ingresses(ing.Namespace).Get(context.TODO(), ing.Name, metav1.GetOptions{})
+	if err != nil {
+		ing.ResourceVersion = ""
+		_, err = replica.NetworkingV1().Ingresses(ing.Namespace).Create(context.TODO(), ing, metav1.CreateOptions{})
+		return err
+	}
+	ing.ResourceVersion = existing.ResourceVersion
+	_, err = replica.NetworkingV1().Ingresses(ing.Namespace).Update(context.TODO(), ing, metav1.UpdateOptions{})
+	return err
+}
+
+// ------------------ Helper Functions ------------------
 // ------------------ Helper Functions ------------------
 
 // getChangeKey generates a key for a resource change.
@@ -497,6 +608,14 @@ func getChangeKey(resourceType, namespace, name, operation string, obj interface
 	case "configmap":
 		if cm, ok := obj.(*corev1.ConfigMap); ok {
 			resourceVersion = cm.ResourceVersion
+		}
+	case "service":
+		if svc, ok := obj.(*corev1.Service); ok {
+			resourceVersion = svc.ResourceVersion
+		}
+	case "ingress":
+		if ing, ok := obj.(*networkingv1.Ingress); ok {
+			resourceVersion = ing.ResourceVersion
 		}
 	case "pvc":
 		if pvc, ok := obj.(*corev1.PersistentVolumeClaim); ok {
@@ -1172,6 +1291,58 @@ func setupPVCInformer(factory informers.SharedInformerFactory) {
 			}
 			if pvc != nil {
 				enqueueReplicationTask("pvc", pvc.Namespace, pvc.Name, "delete", pvc)
+			}
+		},
+	})
+}
+
+func setupServiceInformer(factory informers.SharedInformerFactory) {
+	informer := factory.Core().V1().Services().Informer()
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			svc := obj.(*corev1.Service)
+			enqueueReplicationTask("service", svc.Namespace, svc.Name, "add", svc)
+		},
+		UpdateFunc: func(old, new interface{}) {
+			svc := new.(*corev1.Service)
+			enqueueReplicationTask("service", svc.Namespace, svc.Name, "update", svc)
+		},
+		DeleteFunc: func(obj interface{}) {
+			var svc *corev1.Service
+			switch t := obj.(type) {
+			case *corev1.Service:
+				svc = t
+			case cache.DeletedFinalStateUnknown:
+				svc = t.Obj.(*corev1.Service)
+			}
+			if svc != nil {
+				enqueueReplicationTask("service", svc.Namespace, svc.Name, "delete", svc)
+			}
+		},
+	})
+}
+
+func setupIngressInformer(factory informers.SharedInformerFactory) {
+	informer := factory.Networking().V1().Ingresses().Informer()
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			ing := obj.(*networkingv1.Ingress)
+			enqueueReplicationTask("ingress", ing.Namespace, ing.Name, "add", ing)
+		},
+		UpdateFunc: func(old, new interface{}) {
+			ing := new.(*networkingv1.Ingress)
+			enqueueReplicationTask("ingress", ing.Namespace, ing.Name, "update", ing)
+		},
+		DeleteFunc: func(obj interface{}) {
+			var ing *networkingv1.Ingress
+			switch t := obj.(type) {
+			case *networkingv1.Ingress:
+				ing = t
+			case cache.DeletedFinalStateUnknown:
+				ing = t.Obj.(*networkingv1.Ingress)
+			}
+			if ing != nil {
+				enqueueReplicationTask("ingress", ing.Namespace, ing.Name, "delete", ing)
 			}
 		},
 	})
