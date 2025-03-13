@@ -560,14 +560,26 @@ func replicatePVCToReplica(pvc *corev1.PersistentVolumeClaim, replica *kubernete
 }
 
 func replicateServiceToReplica(svc *corev1.Service, replica *kubernetes.Clientset) error {
-	existing, err := replica.CoreV1().Services(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
+	svcCopy := svc.DeepCopy()
+	svcCopy.Spec.ClusterIP = ""
+	svcCopy.Spec.ClusterIPs = nil
+	// Reset NodePort fields in every port.
+	for i := range svcCopy.Spec.Ports {
+		svcCopy.Spec.Ports[i].NodePort = 0
+	}
+
+	_, err := replica.CoreV1().Services(svcCopy.Namespace).Get(context.TODO(), svcCopy.Name, metav1.GetOptions{})
 	if err != nil {
-		svc.ResourceVersion = ""
-		_, err = replica.CoreV1().Services(svc.Namespace).Create(context.TODO(), svc, metav1.CreateOptions{})
+		svcCopy.ResourceVersion = ""
+		_, err = replica.CoreV1().Services(svcCopy.Namespace).Create(context.TODO(), svcCopy, metav1.CreateOptions{})
 		return err
 	}
-	svc.ResourceVersion = existing.ResourceVersion
-	_, err = replica.CoreV1().Services(svc.Namespace).Update(context.TODO(), svc, metav1.UpdateOptions{})
+	svcCopy.Spec.ClusterIP = ""
+	svcCopy.Spec.ClusterIPs = nil
+	for i := range svcCopy.Spec.Ports {
+		svcCopy.Spec.Ports[i].NodePort = 0
+	}
+	_, err = replica.CoreV1().Services(svcCopy.Namespace).Update(context.TODO(), svcCopy, metav1.UpdateOptions{})
 	return err
 }
 
@@ -1066,6 +1078,18 @@ func replicateToReplica(task ReplicationTask, replica *kubernetes.Clientset) err
 			return fmt.Errorf("object type assertion to PVC failed")
 		}
 		return replicatePVC(task, pvc, replica)
+	case "service":
+		svc, ok := task.Object.(*corev1.Service)
+		if !ok {
+			return fmt.Errorf("object type assertion to Service failed")
+		}
+		return replicateService(task, svc, replica)
+	case "ingress":
+		ing, ok := task.Object.(*networkingv1.Ingress)
+		if !ok {
+			return fmt.Errorf("object type assertion to Ingress failed")
+		}
+		return replicateIngress(task, ing, replica)
 	default:
 		return fmt.Errorf("unsupported resource type: %s", task.ResourceType)
 	}
@@ -1143,6 +1167,47 @@ func replicatePVC(task ReplicationTask, pvc *corev1.PersistentVolumeClaim, repli
 	}
 	pvc.ResourceVersion = existing.ResourceVersion
 	_, err = replica.CoreV1().PersistentVolumeClaims(task.Namespace).Update(context.TODO(), pvc, metav1.UpdateOptions{})
+	return err
+}
+
+func replicateService(task ReplicationTask, svc *corev1.Service, replica *kubernetes.Clientset) error {
+	if task.Operation == "delete" {
+		return replica.CoreV1().Services(task.Namespace).Delete(context.TODO(), task.Name, metav1.DeleteOptions{})
+	}
+	svcCopy := svc.DeepCopy()
+	svcCopy.Spec.ClusterIP = ""
+	svcCopy.Spec.ClusterIPs = nil
+	for i := range svcCopy.Spec.Ports {
+		svcCopy.Spec.Ports[i].NodePort = 0
+	}
+	existing, err := replica.CoreV1().Services(task.Namespace).Get(context.TODO(), task.Name, metav1.GetOptions{})
+	if err != nil {
+		svcCopy.ResourceVersion = ""
+		_, err = replica.CoreV1().Services(task.Namespace).Create(context.TODO(), svcCopy, metav1.CreateOptions{})
+		return err
+	}
+	svcCopy.Spec.ClusterIP = ""
+	svcCopy.Spec.ClusterIPs = nil
+	for i := range svcCopy.Spec.Ports {
+		svcCopy.Spec.Ports[i].NodePort = 0
+	}
+	svc.ResourceVersion = existing.ResourceVersion
+	_, err = replica.CoreV1().Services(task.Namespace).Update(context.TODO(), svc, metav1.UpdateOptions{})
+	return err
+}
+
+func replicateIngress(task ReplicationTask, ingress *networkingv1.Ingress, replica *kubernetes.Clientset) error {
+	if task.Operation == "delete" {
+		return replica.NetworkingV1().Ingresses(task.Namespace).Delete(context.TODO(), task.Name, metav1.DeleteOptions{})
+	}
+	existing, err := replica.NetworkingV1().Ingresses(task.Namespace).Get(context.TODO(), task.Name, metav1.GetOptions{})
+	if err != nil {
+		ingress.ResourceVersion = ""
+		_, err = replica.NetworkingV1().Ingresses(task.Namespace).Create(context.TODO(), ingress, metav1.CreateOptions{})
+		return err
+	}
+	ingress.ResourceVersion = existing.ResourceVersion
+	_, err = replica.NetworkingV1().Ingresses(task.Namespace).Update(context.TODO(), ingress, metav1.UpdateOptions{})
 	return err
 }
 
