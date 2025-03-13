@@ -1,0 +1,142 @@
+# K8s Sync CLI
+
+A Golang CLI application that synchronizes Kubernetes cluster namespaces by replicating resource changes (Deployments, StatefulSets, Secrets, ConfigMaps, and PersistentVolumeClaims) from a primary cluster to one or more replica clusters. The application supports both continuous watch mode and one-time sync mode, and includes built-in Prometheus metrics, a simple REST API for monitoring and management, and SQLite-based persistence for job tracking and user accounts.
+
+## Overview
+
+K8s Sync CLI is designed to simplify the process of replicating resource changes across multiple Kubernetes clusters. It leverages the Kubernetes client-go library to watch for events in a primary cluster and replicate them to configured replica clusters. The application runs in two modes:
+- **Watch Mode (default):** Continuously listens for updates on the primary cluster and replicates changes asynchronously.
+- **One-Time Sync Mode:** Performs an immediate, verbose sync of all resources across specified namespaces (ensuring namespaces exist on replicas first) and then exits.
+
+## Features
+
+- **Resource Syncing:**  
+  - Replicates Deployments, StatefulSets, ConfigMaps, Secrets, and PersistentVolumeClaims.
+  - Supports both continuous watch and one-time sync modes.
+  
+- **Namespace Filtering:**  
+  - By default, skips sensitive namespaces (e.g. namespaces starting with `kube`) unless overridden.
+  - Supports syncing of only specified namespaces via a flag.
+
+- **Persistence & Tracking:**  
+  - Uses SQLite to store sync jobs, their statuses, and user accounts.
+  - Prevents duplicate replication by computing a unique change key per resource change.
+
+- **REST API & Metrics:**  
+  - Provides endpoints for login, dashboard metrics, cluster status, and retrying failed replications.
+  - Exposes Prometheus metrics on `/metrics`.
+
+- **RBAC & Security:**  
+  - Includes RBAC manifests (to be used with Kubernetes deployments) that allow the application to watch and read resources across multiple namespaces.
+  - Built-in authentication using SQLite-backed user accounts with bcrypt password hashing.
+
+## Architecture
+
+The project is organized into several packages:
+
+- **cmd/k8s-sync:**  
+  Contains the application entrypoint. It parses CLI flags, initializes the database, creates Kubernetes clients, and either starts the watch mode or executes one-time sync.
+
+- **internal/db:**  
+  Contains SQLite database initialization and user management logic.
+
+- **internal/handlers:**  
+  Implements HTTP endpoint handlers for the REST API (login, dashboard, status, user management, retry).
+
+- **internal/k8s:**  
+  Contains Kubernetes client creation, informer setup, and resource replication logic.
+
+- **internal/replicator:**  
+  Manages replication tasks and worker routines for processing queued changes.
+
+- **Prometheus Metrics:**  
+  Metrics for job count, latency, and success/failure rates are collected and exposed via the `/metrics` endpoint.
+
+## Installation
+
+### Prerequisites
+
+- [Go 1.18+](https://golang.org/dl/)
+- A working Kubernetes cluster (for primary)
+- Replica cluster kubeconfig files
+- [SQLite3](https://www.sqlite.org/download.html) (or use a pre-built Docker image)
+
+### Building
+
+Clone the repository and build the binary:
+
+```bash
+git clone https://github.com/ayomide101/k8s-sync-cli.git
+cd k8s-sync-cli
+go build -o k8s-sync ./cmd/k8s-sync
+```
+
+### Configuration
+
+The application is configured via CLI flags:
+	•	--primary: Path to the primary cluster’s kubeconfig file.
+	•	--replica-dir: Directory containing kubeconfig files for replica clusters.
+	•	--worker-count: Number of worker goroutines for processing sync tasks.
+	•	--sync-namespaces: Comma-separated list of namespaces to sync. If empty, all non-sensitive namespaces are synced.
+	•	--sync-once: Run one-time sync mode (verbose) and exit.
+	•	--allow-sensitive-namespaces: Allow syncing of sensitive namespaces (names starting with kube).
+
+For example:
+
+```bash
+./k8s-sync --primary=/path/to/primary.kubeconfig --replica-dir=/path/to/replicas --sync-namespaces=default,production --worker-count=5
+```
+
+### Usage
+
+Watch Mode
+
+By default, the application runs in watch mode. It will continuously listen for resource changes on the primary cluster and replicate them to all configured replica clusters.
+
+### One-Time Sync Mode
+
+To perform a one-time sync (synchronously and verbosely), use the --sync-once flag:
+
+```bash
+./k8s-sync --primary=/path/to/primary.kubeconfig --replica-dir=/path/to/replicas --sync-once
+```
+
+In one-time sync mode, the application:
+	1.	Lists namespaces (skipping sensitive ones unless overridden).
+	2.	Ensures each namespace exists on the replica clusters.
+	3.	Iterates through each namespace and syncs Deployments, StatefulSets, ConfigMaps, Secrets, and PersistentVolumeClaims.
+	4.	Provides detailed progress output to the CLI.
+
+### REST API Endpoints
+
+The application exposes a basic REST API on port 8080:
+	•	POST /api/login:
+Accepts JSON credentials to authenticate a user.
+	•	GET /api/dashboard:
+Returns aggregated job metrics (total, ongoing, failed, and pending sync jobs).
+	•	GET /api/status:
+Returns the connectivity status and server version for the primary and replica clusters.
+	•	POST /api/users:
+Allows creation of new user accounts (requires valid credentials).
+	•	GET /retry:
+Allows retrying a failed replication for a specific job on a specified replica (via query parameters jobid and replica).
+	•	/metrics:
+Prometheus metrics endpoint.
+
+## Testing
+
+Run the test suite using:
+
+```bash
+go test -v ./...
+```
+
+An extensive set of tests covers one-time sync functionality, duplicate prevention, error handling, and resource replication.
+
+## Contributing
+
+Contributions are welcome! Please open issues and submit pull requests for improvements and bug fixes. Follow the standard Go project guidelines and ensure tests pass.
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE] file for details.
