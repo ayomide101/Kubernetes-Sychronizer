@@ -1,11 +1,11 @@
-# K8s Sync CLI
+# Kubernetes Cluster Sychronizer
 
-K8s Sync CLI is a Go-based command-line application designed to replicate Kubernetes resources from a primary cluster to one or more replica clusters. It supports both continuous watch mode (where it listens for events and replicates changes as they occur) and one-time sync mode (which performs an immediate, verbose synchronization) and includes built-in Prometheus metrics, a simple REST API for monitoring and management, and SQLite-based persistence for job tracking and user accounts.. The tool is highly configurable, allowing you to select which resource types to sync, restrict syncing to specific namespaces, and even skip sensitive namespaces by default.
+Kubernetes Cluster Sychronizer is a Go-based command-line application designed to replicate Kubernetes resources from a primary cluster to one or more replica clusters. It supports both continuous watch mode (where it listens for events and replicates changes as they occur) and one-time sync mode (which performs an immediate, verbose synchronization) and includes built-in Prometheus metrics, a simple REST API for monitoring and management, and SQLite-based persistence for job tracking and user accounts.. The tool is highly configurable, allowing you to select which resource types to sync, restrict syncing to specific namespaces, and even skip sensitive namespaces by default.
 
 
 ## Overview
 
-K8s Sync CLI is designed to simplify the process of replicating resource changes across multiple Kubernetes clusters. It leverages the Kubernetes client-go library to watch for events in a primary cluster and replicate them to configured replica clusters. The application runs in two modes:
+Kubernetes Cluster Sychronizer is designed to simplify the process of replicating resource changes across multiple Kubernetes clusters. It leverages the Kubernetes client-go library to watch for events in a primary cluster and replicate them to configured replica clusters. The application runs in two modes:
 - **Watch Mode (default):** Continuously listens for updates on the primary cluster and replicates changes asynchronously.
 - **One-Time Sync Mode:** Performs an immediate, verbose sync of all resources across specified namespaces (ensuring namespaces exist on replicas first) and then exits.
 

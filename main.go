@@ -596,7 +596,6 @@ func replicateIngressToReplica(ing *networkingv1.Ingress, replica *kubernetes.Cl
 }
 
 // ------------------ Helper Functions ------------------
-// ------------------ Helper Functions ------------------
 
 // getChangeKey generates a key for a resource change.
 func getChangeKey(resourceType, namespace, name, operation string, obj interface{}) string {
